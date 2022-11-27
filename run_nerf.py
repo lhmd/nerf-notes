@@ -178,6 +178,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # 对空间点进行位置编码
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
@@ -417,55 +418,80 @@ def render_rays(ray_batch,
 
     return ret
 
-
+# 定义解析器：就是把某种格式的文本转换成另一种数据类型
+# parser的解释：https://baijiahao.baidu.com/s?id=1721891391011802155&wfr=spider&for=pc
 def config_parser():
-
+    # 导入模块
     import configargparse
     parser = configargparse.ArgumentParser()
+    # 创建解析对象
+    # 配置文件的地址
     parser.add_argument('--config', is_config_file=True, 
                         help='config file path')
+    # 创建实验名称
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
+    # 输出结果(日志，存储训练时的临时模型)
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
+    # 放训练数据集
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
 
     # training options
+    # 训练提供的选项
+    # 网络层数
     parser.add_argument("--netdepth", type=int, default=8, 
                         help='layers in network')
+    # 网络通道有几个(宽度)
     parser.add_argument("--netwidth", type=int, default=256, 
                         help='channels per layer')
+    # 精细网络的层数
     parser.add_argument("--netdepth_fine", type=int, default=8, 
                         help='layers in fine network')
+    # 精细网络每一层有几个通道
     parser.add_argument("--netwidth_fine", type=int, default=256, 
                         help='channels per layer in fine network')
+    # 每个梯度步长的随机光线数(每次迭代)
     parser.add_argument("--N_rand", type=int, default=32*32*4, 
                         help='batch size (number of random rays per gradient step)')
+    # 学习率
     parser.add_argument("--lrate", type=float, default=5e-4, 
                         help='learning rate')
+    # 学习率的衰减
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
+    # 一次最多处理多少条光线
     parser.add_argument("--chunk", type=int, default=1024*32, 
                         help='number of rays processed in parallel, decrease if running out of memory')
+    # 一次最多处理多少pts
     parser.add_argument("--netchunk", type=int, default=1024*64, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
+    # 一次只能从一张图片中随机获得光线
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
+    # 不从之前的文件加载权重
     parser.add_argument("--no_reload", action='store_true', 
                         help='do not reload weights from saved ckpt')
+    # 存储网络配置权重文件的位置
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
 
     # rendering options
+    # 渲染提供的选项
+    # 每条射线的粗采样数
     parser.add_argument("--N_samples", type=int, default=64, 
                         help='number of coarse samples per ray')
+    # 每条射线的精细采样数
     parser.add_argument("--N_importance", type=int, default=0,
                         help='number of additional fine samples per ray')
+    # 采样点设置扰动影响
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
+    # 使用5D输入而不是3D(RGB)
     parser.add_argument("--use_viewdirs", action='store_true', 
                         help='use full 5D input instead of 3D')
+    # 是否使用位置编码
     parser.add_argument("--i_embed", type=int, default=0, 
                         help='set 0 for default positional encoding, -1 for none')
     parser.add_argument("--multires", type=int, default=10, 
@@ -531,9 +557,11 @@ def config_parser():
     return parser
 
 
+# 训练函数
 def train():
-
+    # 定义解析命令  
     parser = config_parser()
+    
     args = parser.parse_args()
 
     # Load data

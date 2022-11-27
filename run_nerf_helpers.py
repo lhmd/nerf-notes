@@ -64,11 +64,14 @@ def get_embedder(multires, i=0):
 
 
 # Model
+# 定义模型
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
         """ 
         """
+        # 定义网络有哪些层
         super(NeRF, self).__init__()
+        # super和init的理解：https://blog.csdn.net/a__int__/article/details/104600972
         self.D = D
         self.W = W
         self.input_ch = input_ch
