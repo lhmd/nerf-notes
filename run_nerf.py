@@ -494,33 +494,43 @@ def config_parser():
     # 是否使用位置编码
     parser.add_argument("--i_embed", type=int, default=0, 
                         help='set 0 for default positional encoding, -1 for none')
+    # 位置编码最大频率的log2
     parser.add_argument("--multires", type=int, default=10, 
                         help='log2 of max freq for positional encoding (3D location)')
+    # 2D编码最大频率的log2
     parser.add_argument("--multires_views", type=int, default=4, 
                         help='log2 of max freq for positional encoding (2D direction)')
+    # 标准噪声增量
     parser.add_argument("--raw_noise_std", type=float, default=0., 
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
-
+    # 不优化，重新加载权重，渲染路径
     parser.add_argument("--render_only", action='store_true', 
                         help='do not optimize, reload weights and render out render_poses path')
+    # 渲染测试集
     parser.add_argument("--render_test", action='store_true', 
                         help='render the test set instead of render_poses path')
+    # 降低采样因子，加快渲染速度，4或者8为预览所用设置
     parser.add_argument("--render_factor", type=int, default=0, 
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
 
     # training options
+    # 训练central crops用的步骤数
     parser.add_argument("--precrop_iters", type=int, default=0,
                         help='number of steps to train on central crops')
+    # 用于central crops的img部分
     parser.add_argument("--precrop_frac", type=float,
                         default=.5, help='fraction of img taken for central crops') 
 
     # dataset options
+    # 选择数据集
     parser.add_argument("--dataset_type", type=str, default='llff', 
                         help='options: llff / blender / deepvoxels')
+    # 每N张照片用一张，缩小数据集
     parser.add_argument("--testskip", type=int, default=8, 
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
 
     ## deepvoxels flags
+    
     parser.add_argument("--shape", type=str, default='greek', 
                         help='options : armchair / cube / greek / vase')
 
@@ -561,7 +571,6 @@ def config_parser():
 def train():
     # 定义解析命令  
     parser = config_parser()
-    
     args = parser.parse_args()
 
     # Load data
