@@ -30,6 +30,7 @@ def batchify(fn, chunk):
     if chunk is None:
         return fn
     def ret(inputs):
+        # 以chunk分批进入网络，防止显存爆掉
         return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
     return ret
 
@@ -38,14 +39,17 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    # 坐标点进行编码嵌入
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        # 方向进行位置编码
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
 
+    # fn是网络，netchunk控制点的方向
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
@@ -55,6 +59,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
+    # 光线大于chunck进行分批处理
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
@@ -97,6 +102,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays_o, rays_d = get_rays(H, W, K, c2w)
     else:
         # use provided ray batch
+        # 光线的起始位置、方向分解出来
         rays_o, rays_d = rays
 
     if use_viewdirs:
@@ -105,6 +111,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
+        # 单位向量 
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
@@ -118,8 +125,10 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    # 八维向量，前三个是起始位置，中间是视点方向，后面是光线起始位置和最远位置
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     if use_viewdirs:
+        # 加direction的三个坐标
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
@@ -178,42 +187,53 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    # 对空间点进行位置编码
+    # 对空间点x,y,z进行位置编码
+    # 如果使用视角，就对theta进行编码
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+    # 想要=5生效，首先需要use_viewdirs=FALSE并且N_importance>0
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+    # 粗网络
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+    # 粗网络的参数值
     grad_vars = list(model.parameters())
 
     model_fine = None
     if args.N_importance > 0:
+        # 精细网络，参数值和上面相同
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+        # 模型参数
         grad_vars += list(model_fine.parameters())
 
+    # input是实际传进来的点，viewdirs就是方向的单位向量，network_fn是精细网络或粗网络的定义
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
+                                                                # 后面主循环的时候需要传上面三个值，下面三个参数被固定在这里了
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
 
     # Create optimizer
+    # 定义优化器
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
     start = 0
+    # 目录和实验名
     basedir = args.basedir
     expname = args.expname
 
     ##########################
 
     # Load checkpoints
+    # 加载以前训练过的权重和配置
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
@@ -235,6 +255,7 @@ def create_nerf(args):
 
     ##########################
 
+    # 包装了上面的方法参数
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,
@@ -248,6 +269,7 @@ def create_nerf(args):
     }
 
     # NDC only good for LLFF-style forward facing data
+    # 对LLFF数据集有额外的处理
     if args.dataset_type != 'llff' or args.no_ndc:
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
@@ -273,13 +295,17 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # alpha的计算，relu将负数拉平为0
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
+    # 采样点之间的距离
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
+    # 一维->三维
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
+    # rgb经过sigmoid处理
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
@@ -291,18 +317,24 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
+    # 计算公式3
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    # 后面这部分就是Ti，前面是alpha，这个就是论文中的权重w
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
+    # 求出深度图
     depth_map = torch.sum(weights * z_vals, -1)
+    # 视差图
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    # 权重和
     acc_map = torch.sum(weights, -1)
 
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
+    # 只有第一个值在后面被使用过
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
@@ -350,25 +382,28 @@ def render_rays(ray_batch,
         sample.
     """
     N_rays = ray_batch.shape[0]
+    # 光线起始位置和光线的方向
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+    # 视角的单位向量
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
-
+    # 采样点
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
+        # 插值采样
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
     z_vals = z_vals.expand([N_rays, N_samples])
-
+    # 如果设置随机性，取每两个点之间的中值，中值的前一个点就是lower，后一个就是upper
     if perturb > 0.:
         # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
-        # stratified samples in those intervals
+        # stratified samples in those intervals随机数
         t_rand = torch.rand(z_vals.shape)
 
         # Pytest, overwrite u with numpy's fixed random numbers
@@ -379,6 +414,8 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
+    # 空间中的采样点
+    # 出发点+距离*方向
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
@@ -391,27 +428,33 @@ def render_rays(ray_batch,
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # 根据概率密度计算反向的值，得到真实的点
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        # 给精细网络使用的点
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
+        # 使用神经网络
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
+        # 如果是两个网络，这个就是最后精细网络的输出
         ret['raw'] = raw
     if N_importance > 0:
+        # 下面的0是粗网络的输出
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
+    # 检查是否有异常
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
@@ -440,7 +483,7 @@ def config_parser():
 
     # training options
     # 训练提供的选项
-    # 网络层数
+    # 全连接层数
     parser.add_argument("--netdepth", type=int, default=8, 
                         help='layers in network')
     # 网络通道有几个(宽度)
@@ -464,10 +507,12 @@ def config_parser():
     # 一次最多处理多少条光线
     parser.add_argument("--chunk", type=int, default=1024*32, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    # 一次最多处理多少pts
+    # 网络中处理的点的数量
     parser.add_argument("--netchunk", type=int, default=1024*64, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    # 一次只能从一张图片中随机获得光线
+    # 一次只能从一张图片中随机获得光线还是整个训练集所有图片随机采样
+    # 真实数据一般是FALSE
+    # 合成数据是TRUE
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
     # 不从之前的文件加载权重
@@ -491,7 +536,7 @@ def config_parser():
     # 使用5D输入而不是3D(RGB)
     parser.add_argument("--use_viewdirs", action='store_true', 
                         help='use full 5D input instead of 3D')
-    # 是否使用位置编码
+    # 是否使用位置编码，-1表示不使用
     parser.add_argument("--i_embed", type=int, default=0, 
                         help='set 0 for default positional encoding, -1 for none')
     # 位置编码最大频率的log2
@@ -535,12 +580,16 @@ def config_parser():
                         help='options : armchair / cube / greek / vase')
 
     ## blender flags
+    # 背景是白色的
     parser.add_argument("--white_bkgd", action='store_true', 
                         help='set to render synthetic data on a white bkgd (always use for dvoxels)')
+    # 一半的像素值长宽进行训练
+    # 合成数据集使用
     parser.add_argument("--half_res", action='store_true', 
                         help='load blender synthetic data at 400x400 instead of 800x800')
 
     ## llff flags
+    # 下采样的倍数
     parser.add_argument("--factor", type=int, default=8, 
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true', 
@@ -553,10 +602,13 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
+    # log输出的频率
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
+    # 保存模型的频率
+    # 每隔一万保存一次
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000, 
@@ -569,11 +621,12 @@ def config_parser():
 
 # 训练函数
 def train():
-    # 定义解析命令  
+    # 定义解析命令
     parser = config_parser()
     args = parser.parse_args()
 
     # Load data
+    # 四种数据输入格式定义不同的处理方式
     K = None
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
@@ -603,7 +656,9 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
 
+    # 这是合成数据集，以这个为例
     elif args.dataset_type == 'blender':
+        # 加载数据集
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
@@ -612,6 +667,7 @@ def train():
         far = 6.
 
         if args.white_bkgd:
+            # 如果给定白背景参数
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
             images = images[...,:3]
@@ -645,23 +701,27 @@ def train():
         return
 
     # Cast intrinsics to right types
+    # 宽，高，焦距
     H, W, focal = hwf
     H, W = int(H), int(W)
     hwf = [H, W, focal]
-
+    # K是相机内参的参数矩阵
+    # 处理相机坐标系和图像坐标系
     if K is None:
         K = np.array([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
             [0, 0, 1]
         ])
-
+    # 使用测试集的pose而不是固定生成的render_poses
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
+    # 保存log的地址和实验名称
     basedir = args.basedir
     expname = args.expname
+    # create log files
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -669,12 +729,14 @@ def train():
             attr = getattr(args, arg)
             file.write('{} = {}\n'.format(arg, attr))
     if args.config is not None:
+        # 命令行指定的config文件
         f = os.path.join(basedir, expname, 'config.txt')
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    # Create nerf model
+    # Create nerf model创建神经网络
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    # 从中间某一次实验恢复的，start就不是0
     global_step = start
 
     bds_dict = {
@@ -688,7 +750,9 @@ def train():
     render_poses = torch.Tensor(render_poses).to(device)
 
     # Short circuit if only rendering out from trained model
+    # 使用render_poses
     if args.render_only:
+        # 仅进行渲染，不进行训练
         print('RENDER ONLY')
         with torch.no_grad():
             if args.render_test:
@@ -709,12 +773,16 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
+    # N_rand是1024，每一次使用多少光线进行计算
     N_rand = args.N_rand
     use_batching = not args.no_batching
+    # 是否使用batch
     if use_batching:
+        # 在所有图片随机选取1024光线，否则就是在一张图片上选取
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        # rays和图像混在一起
         print('done, concats')
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
@@ -722,12 +790,14 @@ def train():
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
+        # 将光线打乱
         np.random.shuffle(rays_rgb)
 
         print('done')
         i_batch = 0
 
     # Move training data to GPU
+    # 把所有的值都放到目标设备上
     if use_batching:
         images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
@@ -735,6 +805,9 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
+    # 打印出训练、测试、验证集的i值
+    # 做两万次迭代
+    # 加一是因为强迫症，不想看到19999这种数字
     N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
@@ -745,18 +818,21 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
+    # 迭代的主循环
     for i in trange(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
         if use_batching:
             # Random over all images
+            # 使用了全部图片的光线
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
+                # 每次处理结束之后重新打乱
                 print("Shuffle data after an epoch!")
                 rand_idx = torch.randperm(rays_rgb.shape[0])
                 rays_rgb = rays_rgb[rand_idx]
@@ -764,14 +840,19 @@ def train():
 
         else:
             # Random from one image
+            # 从训练集中随机取一张图片
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
+            # N_rand=1024第一次，选取的像素点个数
             if N_rand is not None:
+                # getray将点转化成光线
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
+                # precrop_iters：number of steps train on central crops
+                # 先在中心区域进行训练，到达一定步数后再在整张图片上进行训练
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
@@ -787,33 +868,43 @@ def train():
 
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                # 选出的像素坐标
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
+                # target也同样选出对应位置的点，用于最后的mse loss计算
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # rgb网络计算出的图像
+        # 前三十精细网络的输出内容，其他的还保存在一个dict中，有5项
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
+        # 计算loss
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
+        # 计算指标
         psnr = mse2psnr(img_loss)
 
+        # rgb0和粗网络的输出
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        # 梯度回传
         loss.backward()
+        # 梯度分析
         optimizer.step()
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
+        # 学习率衰减
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
@@ -826,6 +917,7 @@ def train():
         #####           end            #####
 
         # Rest is logging
+        # 保存模型
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
@@ -836,6 +928,7 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
+        # 生成测试视频
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
@@ -852,6 +945,7 @@ def train():
             #     render_kwargs_test['c2w_staticcam'] = None
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
+        # 执行测试，使用测试数据
         if i%args.i_testset==0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
@@ -862,6 +956,7 @@ def train():
 
 
     
+        # 打印log信息的频率
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
         """
